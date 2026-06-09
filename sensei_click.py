@@ -45,6 +45,19 @@ class DetectionResult:
 VERTEX_TEMPLATE = None
 
 
+def enable_dpi_awareness():
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
+enable_dpi_awareness()
+
+
 class DebugLog:
     def __init__(self, root):
         self.enabled = bool(root)
@@ -137,6 +150,22 @@ def longest_border_runs(img):
     return runs
 
 
+def looks_like_star_field_below(screen, x0, x1, y):
+    sample_y = y + 40
+    if sample_y >= screen.height:
+        return False
+    pix = screen.load()
+    step = max(1, (x1 - x0 + 1) // 80)
+    hits = 0
+    total = 0
+    for x in range(x0 + 20, x1 - 20, step):
+        r, g, b = pix[x, sample_y]
+        total += 1
+        if b >= 45 and b > r + 12 and b > g + 4 and r <= 90 and g <= 100:
+            hits += 1
+    return total > 0 and hits / total >= 0.55
+
+
 def auto_detect_rect(screen):
     runs = longest_border_runs(screen)
     best = None
@@ -154,6 +183,46 @@ def auto_detect_rect(screen):
             score = 1000 - abs(width - 553) * 2 - abs(height - 289) * 3
             if best is None or score > best[0]:
                 best = (score, x0, top_y, x1, bottom_y)
+    if best is None:
+        # When the moving constellation starts near the lower edge, it can cover
+        # the bottom border. The top border plus the dark blue star field below
+        # is still stable enough to infer the usual field height.
+        for top_y, top_x0, top_x1, top_len in runs:
+            if not 520 <= top_len <= 620:
+                continue
+            if not int(screen.height * 0.18) <= top_y <= int(screen.height * 0.65):
+                continue
+            if not looks_like_star_field_below(screen, top_x0, top_x1, top_y):
+                continue
+            x0, x1 = top_x0, top_x1
+            bottom_y = min(screen.height - 1, top_y + 288)
+            score = 850 - abs(top_len - 553) * 2 - abs((bottom_y - top_y + 1) - 289) * 3
+            if best is None or score > best[0]:
+                best = (score, x0, top_y, x1, bottom_y)
+    if best is None:
+        # Conversely, a large constellation near the top can break the field's
+        # upper border while the modal/header top and field bottom remain visible.
+        # In that case infer the field top from the usual field height.
+        for i, (modal_y, modal_x0, modal_x1, modal_len) in enumerate(runs):
+            if not 600 <= modal_len <= 680:
+                continue
+            if not int(screen.height * 0.18) <= modal_y <= int(screen.height * 0.45):
+                continue
+            for bottom_y, bottom_x0, bottom_x1, bottom_len in runs[i + 1:]:
+                height = bottom_y - modal_y + 1
+                if not 340 <= height <= 390:
+                    continue
+                if not 520 <= bottom_len <= 620:
+                    continue
+                x0, x1 = bottom_x0, bottom_x1
+                top_y = bottom_y - 288
+                if top_y <= modal_y + 35:
+                    continue
+                if not looks_like_star_field_below(screen, x0, x1, top_y):
+                    continue
+                score = 820 - abs(bottom_len - 553) * 2 - abs(height - 366) * 2
+                if best is None or score > best[0]:
+                    best = (score, x0, top_y, x1, bottom_y)
     if best is None:
         raise RuntimeError("star field rectangle was not auto-detected")
 
@@ -359,9 +428,11 @@ def detect_overlay_and_stars(field, allow_clipped=False):
     box_h = box[3] - box[1] + 1
     touches_edge = box[0] <= 2 or box[1] <= 2 or box[2] >= field.width - 3 or box[3] >= field.height - 3
     # Some valid constellations are tall and can occupy most of the field
-    # height. Reject only shapes that are actually on the edge or implausibly
-    # large; the template vertex detector below is the stronger validation.
-    if not allow_clipped and (touches_edge or box_w > field.width * 0.75 or box_h > field.height * 0.85):
+    # height. Reject actual edge contact and broad polluted regions, but allow
+    # narrow/tall constellations to pass to the template vertex detector.
+    too_wide = box_w > field.width * 0.75
+    too_broad_and_tall = box_h > field.height * 0.85 and box_w > field.width * 0.45
+    if not allow_clipped and (touches_edge or too_wide or too_broad_and_tall):
         raise RuntimeError(f"moving constellation line looks clipped or polluted: box={box}")
     expanded = (box[0] - 20, box[1] - 20, box[2] + 20, box[3] + 20)
 
@@ -593,6 +664,7 @@ def sample_live(args, debug=None, attempt=0):
     star_frames = []
     motion_samples_x = []
     motion_samples_y = []
+    clipped_sweep_frames = 0
 
     def try_precenter(prefix, save_first_full):
         nonlocal start_x, start_y
@@ -668,6 +740,8 @@ def sample_live(args, debug=None, attempt=0):
         try:
             frame = detect_overlay_and_stars(field)
         except Exception as exc:
+            if "clipped or polluted" in str(exc):
+                clipped_sweep_frames += 1
             if debug and debug.enabled:
                 debug.log(f"{label}: skipped={exc}")
             continue
@@ -701,6 +775,8 @@ def sample_live(args, debug=None, attempt=0):
     except Exception as exc:
         if base_frame is None:
             raise
+        if "moving constellation line was not detected" in str(exc):
+            raise RuntimeError(f"current frame lost moving constellation: {exc}")
         current = base_frame
         if debug and debug.enabled:
             debug.log(f"{label}: using base frame because current failed: {exc}")
@@ -710,6 +786,17 @@ def sample_live(args, debug=None, attempt=0):
     if len(frames) < 2:
         raise RuntimeError(f"too few usable sweep frames: {len(frames)}")
     min_hits = min(args.min_star_frames, len(star_frames))
+    # When large constellations sit near an edge, several sweep frames can be
+    # clipped and skipped. Keep the click confidence strict, but avoid starving
+    # the matcher of background candidates in that sparse-frame case.
+    if clipped_sweep_frames > 0 and len(star_frames) <= 4 and min_hits > 2:
+        min_hits = 2
+        if debug and debug.enabled:
+            debug.log(
+                f"attempt{attempt:02d}: sparse_usable_frames={len(star_frames)} "
+                f"clipped_sweep_frames={clipped_sweep_frames} "
+                f"persistent_star_frames lowered to {min_hits}"
+            )
     stars = merge_persistent_stars(star_frames, args.merge_distance, min_hits)
     if len(stars) < args.min_background_stars and min_hits > 1:
         min_hits -= 1
@@ -779,43 +866,259 @@ def move_to_target_with_verify(args, debug, stars, motion_gain, nx, ny, label):
     return False
 
 
-def main():
-    global VERTEX_TEMPLATE
-    parser = argparse.ArgumentParser(description="Find and click the matching constellation position.")
-    parser.add_argument("--image", help="Analyze a screenshot PNG instead of the live screen.")
-    parser.add_argument("--rect", type=parse_rect, default=DEFAULT_RECT, help="Star field rectangle: x,y,width,height or auto")
-    parser.add_argument("--tolerance", type=float, default=11.0, help="Pixel tolerance for star matching")
-    parser.add_argument("--merge-distance", type=float, default=8.0, help="Merge distance for background stars sampled across frames")
-    parser.add_argument("--min-star-frames", type=int, default=3, help="Keep background stars seen in at least this many sweep frames")
-    parser.add_argument("--min-background-stars", type=int, default=25, help="Fallback to a lower min-star-frames if fewer stars remain")
-    parser.add_argument("--offsets", type=parse_offsets, default=parse_offsets(DEFAULT_OFFSETS), help="Cursor sweep offsets: x,y;x,y")
-    parser.add_argument("--base", choices=("center", "current"), default="center", help="Sweep base. center uses the star field center; current uses current cursor position")
-    parser.add_argument("--start-delay", type=float, default=2.5, help="Seconds to wait before live capture starts, so you can return focus to the game")
-    parser.add_argument("--settle", type=float, default=0.045, help="Seconds to wait after each cursor move")
-    parser.add_argument("--retry-until", type=float, default=8.0, help="Retry seconds before giving up. Late retries benefit from disappearing decoy stars.")
-    parser.add_argument("--retry-interval", type=float, default=0.35, help="Seconds between retries")
-    parser.add_argument("--min-matches", type=int, default=3, help="Minimum matched overlay vertices before clicking")
-    parser.add_argument("--min-coverage", type=float, default=0.50, help="Minimum matched overlay ratio before clicking")
-    parser.add_argument("--dry-run", action="store_true", help="Print detection result without moving/clicking to the final position")
-    parser.add_argument("--move-only", action="store_true", help="Move mouse to the detected position without clicking")
-    parser.add_argument("--debug-dir", help="Save captured fields and log files under this directory")
-    parser.add_argument("--vertex-template", default=DEFAULT_TEMPLATE_PATH, help="Learned vertex template JSON")
-    args = parser.parse_args()
-    debug = DebugLog(args.debug_dir)
-    VERTEX_TEMPLATE = load_vertex_template(args.vertex_template)
-    if debug.enabled and VERTEX_TEMPLATE:
-        debug.log(f"vertex_template={args.vertex_template} threshold={VERTEX_TEMPLATE.get('threshold')} radius={VERTEX_TEMPLATE.get('radius')}")
+def is_start_dialog_gray(r, g, b):
+    return 75 <= r <= 180 and 75 <= g <= 180 and 75 <= b <= 180 and max(r, g, b) - min(r, g, b) <= 45
 
-    if args.image:
-        best, frame = analyze_static_image(args)
-        if not confidence_ok(best, len(frame.overlay), args.min_matches, args.min_coverage):
-            raise RuntimeError("static image confidence is low")
-        return 0
 
-    if args.start_delay > 0:
-        print(f"Starting in {args.start_delay:.1f}s. Focus the game window now.")
-        time.sleep(args.start_delay)
+def is_start_panel_dark(r, g, b):
+    return 35 <= r <= 115 and 35 <= g <= 115 and 35 <= b <= 115 and max(r, g, b) - min(r, g, b) <= 35
 
+
+def find_auto_fish_button(screen):
+    # The fishing prompt is a dark gray modal around the lower center of the
+    # screen. The "自分で釣る" button is the small gray rectangle near its bottom.
+    pix = screen.load()
+    x0 = int(screen.width * 0.32)
+    x1 = int(screen.width * 0.68)
+    y0 = int(screen.height * 0.34)
+    y1 = int(screen.height * 0.74)
+    panel_mask = []
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            if is_start_panel_dark(*pix[x, y]):
+                panel_mask.append((x, y))
+
+    panels = []
+    for comp in components(panel_mask):
+        if len(comp) < 8000:
+            continue
+        xs = [p[0] for p in comp]
+        ys = [p[1] for p in comp]
+        px0, py0, px1, py1 = min(xs), min(ys), max(xs), max(ys)
+        pw = px1 - px0 + 1
+        ph = py1 - py0 + 1
+        if 180 <= pw <= 330 and 130 <= ph <= 260:
+            panels.append((len(comp), (px0, py0, px1, py1)))
+    if not panels:
+        boxes = find_auto_fish_button_fallback(screen, x0, x1, y0, y1)
+        if not boxes:
+            return None
+        _, box = max(boxes, key=lambda item: item[0])
+        bx0, by0, bx1, by1 = box
+        return ((bx0 + bx1) / 2, (by0 + by1) / 2, box)
+
+    boxes = []
+    for panel_area, panel in panels:
+        px0, py0, px1, py1 = panel
+        pw = px1 - px0 + 1
+        ph = py1 - py0 + 1
+        mask = []
+        for y in range(py0, py1 + 1):
+            for x in range(px0, px1 + 1):
+                if is_start_dialog_gray(*pix[x, y]):
+                    mask.append((x, y))
+
+        for comp in components(mask):
+            if len(comp) < 500:
+                continue
+            xs = [p[0] for p in comp]
+            ys = [p[1] for p in comp]
+            bx0, by0, bx1, by1 = min(xs), min(ys), max(xs), max(ys)
+            w = bx1 - bx0 + 1
+            h = by1 - by0 + 1
+            bcx = (bx0 + bx1) / 2
+            if 45 <= w <= 120 and 28 <= h <= 48 and screen.width * 0.43 <= bcx <= screen.width * 0.62 and by0 >= py0 + ph * 0.65:
+                # Prefer the button-sized component near the bottom of an
+                # actual fishing prompt panel. Checking every candidate panel
+                # handles reward popups overlapping the prompt.
+                score = (
+                    panel_area / 100.0
+                    + by0 - py0
+                    - abs(w - 58) * 2.0
+                    - abs(h - 35) * 2.0
+                    - abs((bcx - px0) / pw - 0.50) * 80.0
+                )
+                boxes.append((score, (bx0, by0, bx1, by1)))
+
+    if not boxes:
+        boxes = find_auto_fish_button_fallback(screen, x0, x1, y0, y1)
+        if not boxes:
+            return None
+    _, box = max(boxes, key=lambda item: item[0])
+    bx0, by0, bx1, by1 = box
+    return ((bx0 + bx1) / 2, (by0 + by1) / 2, box)
+
+
+def find_auto_fish_button_fallback(screen, x0, x1, y0, y1):
+    # Reward popups can overlap the fishing prompt after a successful round.
+    # In that state the prompt panel is no longer the largest dark component,
+    # but the small "自分で釣る" button remains visible near the lower center.
+    pix = screen.load()
+    mask = []
+    for y in range(y0, y1):
+        for x in range(x0, x1):
+            if is_start_dialog_gray(*pix[x, y]):
+                mask.append((x, y))
+
+    gray_components = []
+    boxes = []
+    for comp in components(mask):
+        if len(comp) < 450:
+            continue
+        xs = [p[0] for p in comp]
+        ys = [p[1] for p in comp]
+        bx0, by0, bx1, by1 = min(xs), min(ys), max(xs), max(ys)
+        w = bx1 - bx0 + 1
+        h = by1 - by0 + 1
+        bcx = (bx0 + bx1) / 2
+        bcy = (by0 + by1) / 2
+        gray_components.append((len(comp), bx0, by0, bx1, by1, w, h, bcx, bcy))
+
+    for _, bx0, by0, bx1, by1, w, h, bcx, bcy in gray_components:
+        if not (45 <= w <= 120 and 28 <= h <= 48):
+            continue
+        if not (screen.width * 0.43 <= bcx <= screen.width * 0.58):
+            continue
+        if not (screen.height * 0.50 <= bcy <= screen.height * 0.68):
+            continue
+
+        text_bands = 0
+        for _, tx0, ty0, tx1, ty1, tw, th, tcx, _ in gray_components:
+            if tw < 170 or th < 25 or th > 90:
+                continue
+            if not (bcy - 230 <= ty0 and ty1 <= by0 - 45):
+                continue
+            overlap = min(bx1 + 170, tx1) - max(bx0 - 170, tx0) + 1
+            if overlap > 0 and abs(tcx - bcx) <= 170:
+                text_bands += 1
+        if text_bands < 1:
+            continue
+
+        dark_hits = 0
+        total = 0
+        for sy in range(max(0, by0 - 95), max(0, by0 - 15), 4):
+            for sx in range(max(0, bx0 - 90), min(screen.width, bx1 + 91), 4):
+                total += 1
+                if is_start_panel_dark(*pix[sx, sy]):
+                    dark_hits += 1
+        if total == 0 or dark_hits / total < 0.25:
+            continue
+        score = 500 - abs(w - 58) * 2.0 - abs(h - 35) * 2.0 - abs(bcx - screen.width * 0.47) / 4.0
+        boxes.append((score, (bx0, by0, bx1, by1)))
+    return boxes
+
+
+def wait_and_click_auto_fish(args, debug, loop_index):
+    deadline = time.monotonic() + args.start_wait_timeout
+    last_seen = None
+    stable_found = None
+    stable_count = 0
+    while time.monotonic() < deadline:
+        screen = grab_screen()
+        found = find_auto_fish_button(screen)
+        if found:
+            x, y, box = found
+            if stable_found:
+                last_x, last_y, _ = stable_found
+                if math.hypot(x - last_x, y - last_y) <= args.start_confirm_distance:
+                    stable_count += 1
+                else:
+                    stable_count = 1
+            else:
+                stable_count = 1
+            stable_found = found
+            if stable_count < args.start_confirm_frames:
+                if debug.enabled:
+                    debug.log(
+                        f"loop{loop_index:03d}: start_button candidate "
+                        f"box={box} click=({x:.0f},{y:.0f}) stable={stable_count}/{args.start_confirm_frames}"
+                    )
+                time.sleep(args.start_poll_interval)
+                continue
+            if debug.enabled:
+                marked = screen.copy()
+                draw = ImageDraw.Draw(marked)
+                draw.rectangle(box, outline=(255, 0, 0), width=3)
+                debug.save_image(f"loop{loop_index:03d}_start_button.png", marked)
+                debug.log(
+                    f"loop{loop_index:03d}: start_button box={box} click=({x:.0f},{y:.0f}) "
+                    f"stable={stable_count}/{args.start_confirm_frames}"
+                )
+            if not args.dry_run:
+                Mouse.move_to(x, y)
+                time.sleep(0.08)
+                actual_x, actual_y = Mouse.pos()
+                if debug.enabled:
+                    marked = screen.copy()
+                    draw = ImageDraw.Draw(marked)
+                    draw.rectangle(box, outline=(255, 0, 0), width=3)
+                    draw.line((actual_x - 12, actual_y, actual_x + 12, actual_y), fill=(0, 255, 0), width=2)
+                    draw.line((actual_x, actual_y - 12, actual_x, actual_y + 12), fill=(0, 255, 0), width=2)
+                    debug.save_image(f"loop{loop_index:03d}_start_click_pos.png", marked)
+                    debug.log(
+                        f"loop{loop_index:03d}: start_click target=({x:.0f},{y:.0f}) "
+                        f"actual=({actual_x},{actual_y}) delta=({actual_x - x:.1f},{actual_y - y:.1f})"
+                    )
+                    debug.save_text()
+                Mouse.click()
+            else:
+                print(f"DRY-RUN start: would click auto-fish button at ({x:.0f},{y:.0f})")
+            return True
+        stable_found = None
+        stable_count = 0
+        if last_seen is None or time.monotonic() - last_seen > 2.0:
+            last_seen = time.monotonic()
+            if debug.enabled:
+                debug.log(f"loop{loop_index:03d}: waiting for start button")
+        time.sleep(args.start_poll_interval)
+    raise RuntimeError("start button was not detected before timeout")
+
+
+def move_to_expected_star_field_center(args, debug, loop_index):
+    screen = grab_screen()
+    if args.rect is not None:
+        rx, ry, rw, rh = args.rect
+        x, y = rx + rw / 2, ry + rh / 2
+    else:
+        x, y = screen.width / 2, screen.height * 0.47
+    Mouse.move_to(x, y)
+    if debug.enabled:
+        debug.log(f"loop{loop_index:03d}: moved_to_expected_field_center target=({x:.0f},{y:.0f}) actual={Mouse.pos()}")
+
+
+def wait_for_star_field(args, debug, loop_index):
+    deadline = time.monotonic() + args.field_wait_timeout
+    last_seen = None
+    last_error = None
+    while time.monotonic() < deadline:
+        screen = grab_screen()
+        try:
+            rect = auto_detect_rect(screen)
+            if debug.enabled:
+                marked = screen.copy()
+                draw = ImageDraw.Draw(marked)
+                rx, ry, rw, rh = rect
+                draw.rectangle((rx, ry, rx + rw, ry + rh), outline=(255, 0, 0), width=3)
+                debug.save_image(f"loop{loop_index:03d}_star_field_ready.png", marked)
+                debug.log(f"loop{loop_index:03d}: star_field_ready rect={rect}")
+                debug.save_text()
+            return rect
+        except Exception as exc:
+            last_error = str(exc)
+            if last_seen is None or time.monotonic() - last_seen > 0.75:
+                last_seen = time.monotonic()
+                if debug.enabled:
+                    debug.log(f"loop{loop_index:03d}: waiting for star field: {last_error}")
+        time.sleep(args.field_poll_interval)
+
+    if debug.enabled:
+        debug.save_image(f"loop{loop_index:03d}_star_field_timeout.png", grab_screen())
+        debug.log(f"loop{loop_index:03d}: star_field_timeout last_error={last_error}")
+        debug.save_text()
+    raise RuntimeError(f"star field did not appear after start click: {last_error}")
+
+
+def run_constellation_once(args, debug):
     args.rect = resolve_rect(grab_screen(), args.rect)
     if debug.enabled:
         debug.log(f"locked_rect={args.rect}")
@@ -823,14 +1126,11 @@ def main():
     deadline = time.monotonic() + args.retry_until
     last_error = None
     attempt = 0
-    best_seen = None
     while True:
         try:
             result = sample_live(args, debug, attempt)
             frame, stars, best, frame_count = result.frame, result.stars, result.best, result.frame_count
             print_result("live-sweep", frame, stars, best, frame_count)
-            if best_seen is None or best[0] > best_seen[0][0]:
-                best_seen = (best, frame, stars, Mouse.pos(), result.motion_gain)
             if confidence_ok(best, len(frame.overlay), args.min_matches, args.min_coverage):
                 _, _, dx, dy, _, _, _ = best
                 cx, cy = Mouse.pos()
@@ -868,39 +1168,85 @@ def main():
                 debug.log(f"attempt{attempt:02d}: error={last_error}")
 
         if time.monotonic() >= deadline:
-            if best_seen is not None:
-                best, frame, stars, mouse_pos, motion_gain = best_seen
-                score, matched, dx, dy, avg_error, max_error, coverage = best
-                required = required_match_count(len(frame.overlay), args.min_matches, args.min_coverage)
-                if confidence_ok(best, len(frame.overlay), args.min_matches, args.min_coverage):
-                    debug.log(
-                        "fallback_click "
-                        f"matched={matched}/{len(frame.overlay)} coverage={coverage:.2f} "
-                        f"required={required} avg_error={avg_error:.1f} max_error={max_error:.1f} "
-                        f"mouse={mouse_pos} offset=({dx:.1f},{dy:.1f})"
-                    )
-                    mdx, mdy = field_to_mouse_offset(dx, dy, motion_gain)
-                    nx, ny = mouse_pos[0] + mdx, mouse_pos[1] + mdy
-                    print(
-                        f"fallback mouse=({mouse_pos[0]},{mouse_pos[1]}) -> "
-                        f"({nx:.0f},{ny:.0f}) matched={matched}/{len(frame.overlay)}"
-                    )
-                    if args.dry_run:
-                        debug.save_text()
-                        print(f"DRY-RUN fallback success: would move to ({nx:.0f},{ny:.0f}) and click")
-                        return 0
-                    if not move_to_target_with_verify(args, debug, stars, motion_gain, nx, ny, f"attempt{attempt:02d}_fallback_final"):
-                        debug.log("fallback final move verification failed")
-                        debug.save_text()
-                        raise RuntimeError("fallback final move verification failed")
-                    if not args.move_only:
-                        Mouse.click()
-                    debug.save_text()
-                    return 0
             debug.save_text()
             raise RuntimeError(f"gave up before confident click: {last_error}")
         time.sleep(args.retry_interval)
         attempt += 1
+
+
+def main():
+    global VERTEX_TEMPLATE
+    parser = argparse.ArgumentParser(description="Find and click the matching constellation position.")
+    parser.add_argument("--image", help="Analyze a screenshot PNG instead of the live screen.")
+    parser.add_argument("--rect", type=parse_rect, default=DEFAULT_RECT, help="Star field rectangle: x,y,width,height or auto")
+    parser.add_argument("--tolerance", type=float, default=11.0, help="Pixel tolerance for star matching")
+    parser.add_argument("--merge-distance", type=float, default=8.0, help="Merge distance for background stars sampled across frames")
+    parser.add_argument("--min-star-frames", type=int, default=3, help="Keep background stars seen in at least this many sweep frames")
+    parser.add_argument("--min-background-stars", type=int, default=25, help="Fallback to a lower min-star-frames if fewer stars remain")
+    parser.add_argument("--offsets", type=parse_offsets, default=parse_offsets(DEFAULT_OFFSETS), help="Cursor sweep offsets: x,y;x,y")
+    parser.add_argument("--base", choices=("center", "current"), default="center", help="Sweep base. center uses the star field center; current uses current cursor position")
+    parser.add_argument("--start-delay", type=float, default=2.5, help="Seconds to wait before live capture starts, so you can return focus to the game")
+    parser.add_argument("--settle", type=float, default=0.045, help="Seconds to wait after each cursor move")
+    parser.add_argument("--retry-until", type=float, default=8.0, help="Retry seconds before giving up. Late retries benefit from disappearing decoy stars.")
+    parser.add_argument("--retry-interval", type=float, default=0.35, help="Seconds between retries")
+    parser.add_argument("--min-matches", type=int, default=3, help="Minimum matched overlay vertices before clicking")
+    parser.add_argument("--min-coverage", type=float, default=0.50, help="Minimum matched overlay ratio before clicking")
+    parser.add_argument("--dry-run", action="store_true", help="Print detection result without moving/clicking to the final position")
+    parser.add_argument("--move-only", action="store_true", help="Move mouse to the detected position without clicking")
+    parser.add_argument("--debug-dir", help="Save captured fields and log files under this directory")
+    parser.add_argument("--vertex-template", default=DEFAULT_TEMPLATE_PATH, help="Learned vertex template JSON")
+    parser.add_argument("--auto-loop", action="store_true", help="Wait for the fishing prompt, click the start button, clear the constellation, and repeat")
+    parser.add_argument("--loop-count", type=int, default=0, help="Number of auto-loop cycles. 0 means run until stopped")
+    parser.add_argument("--start-wait-timeout", type=float, default=90.0, help="Seconds to wait for the fishing start prompt in auto-loop mode")
+    parser.add_argument("--start-poll-interval", type=float, default=0.25, help="Seconds between start prompt checks")
+    parser.add_argument("--start-confirm-frames", type=int, default=2, help="Require this many consecutive start button detections before clicking")
+    parser.add_argument("--start-confirm-distance", type=float, default=6.0, help="Maximum pixel drift allowed between consecutive start button detections")
+    parser.add_argument("--after-start-delay", type=float, default=0.2, help="Seconds to wait after clicking the fishing start button before solving the constellation")
+    parser.add_argument("--field-wait-timeout", type=float, default=5.0, help="Seconds to wait for the constellation field after clicking the fishing start button")
+    parser.add_argument("--field-poll-interval", type=float, default=0.10, help="Seconds between constellation field checks after the start click")
+    args = parser.parse_args()
+    debug = DebugLog(args.debug_dir)
+    VERTEX_TEMPLATE = load_vertex_template(args.vertex_template)
+    if debug.enabled and VERTEX_TEMPLATE:
+        debug.log(f"vertex_template={args.vertex_template} threshold={VERTEX_TEMPLATE.get('threshold')} radius={VERTEX_TEMPLATE.get('radius')}")
+
+    if args.image:
+        best, frame = analyze_static_image(args)
+        if not confidence_ok(best, len(frame.overlay), args.min_matches, args.min_coverage):
+            raise RuntimeError("static image confidence is low")
+        return 0
+
+    if args.auto_loop:
+        print("Auto-loop mode. Focus the game window now; press Ctrl+C in this console to stop.")
+        if args.start_delay > 0:
+            time.sleep(args.start_delay)
+        loop_index = 0
+        while args.loop_count <= 0 or loop_index < args.loop_count:
+            if debug.enabled:
+                debug.log(f"loop{loop_index:03d}: begin")
+            try:
+                wait_and_click_auto_fish(args, debug, loop_index)
+                move_to_expected_star_field_center(args, debug, loop_index)
+                time.sleep(args.after_start_delay)
+                args.rect = wait_for_star_field(args, debug, loop_index)
+                run_constellation_once(args, debug)
+                if debug.enabled:
+                    debug.log(f"loop{loop_index:03d}: complete")
+                    debug.save_text()
+            except Exception as exc:
+                if debug.enabled:
+                    debug.log(f"loop{loop_index:03d}: skipped_after_error={exc}")
+                    debug.save_text()
+                print(f"loop{loop_index:03d}: skipped after error: {exc}")
+            loop_index += 1
+            time.sleep(0.5)
+        return 0
+
+    if args.start_delay > 0:
+        print(f"Starting in {args.start_delay:.1f}s. Focus the game window now.")
+        time.sleep(args.start_delay)
+
+    return run_constellation_once(args, debug)
 
 
 if __name__ == "__main__":

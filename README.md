@@ -29,6 +29,16 @@ By default the BAT waits 4 seconds before capturing the live screen. It then mov
 
 If the game is running as administrator, run the BAT or PowerShell as administrator too.
 
+## Auto loop
+
+To wait for the fishing prompt, click `自分で釣る`, clear the constellation mini-game, and then keep waiting for the next prompt:
+
+```powershell
+.\run_sensei_auto_loop.bat
+```
+
+Stop the loop with `Ctrl+C` in the console.
+
 ## Dry run
 
 Print the detected movement without the final click:
