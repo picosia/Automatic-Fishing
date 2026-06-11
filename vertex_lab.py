@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Development-only helper for inspecting/rebuilding vertex templates.
+# Normal automation BAT files and sensei_click.py runtime do not call this file.
 import argparse
 import math
 import os
