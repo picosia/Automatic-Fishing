@@ -72,6 +72,7 @@ class DebugLog:
         self.enabled = bool(root)
         self.root = None
         self.lines = []
+        self.saved_line_count = 0
         self.deferred_images = []
         self.max_deferred_images = 120
         if self.enabled:
@@ -106,8 +107,13 @@ class DebugLog:
 
     def save_text(self):
         if self.enabled:
-            with open(os.path.join(self.root, "log.txt"), "w", encoding="utf-8") as f:
-                f.write("\n".join(self.lines) + "\n")
+            new_lines = self.lines[self.saved_line_count :]
+            if not new_lines:
+                return
+            mode = "a" if self.saved_line_count else "w"
+            with open(os.path.join(self.root, "log.txt"), mode, encoding="utf-8") as f:
+                f.write("\n".join(new_lines) + "\n")
+            self.saved_line_count = len(self.lines)
 
 
 def is_magenta(r, g, b):
@@ -118,10 +124,6 @@ def is_star_pixel(r, g, b):
     # White/lavender star pixels. The moving pattern uses similar whites, so callers
     # filter out pixels near the moving overlay when collecting fixed background stars.
     return b > 125 and r > 105 and g > 105 and (r + g + b) > 405 and max(r, g, b) - min(r, g, b) < 105
-
-
-def brightness(rgb):
-    return sum(rgb) / 3
 
 
 def field_stats(field):
@@ -559,19 +561,6 @@ def load_vertex_template(path):
         path = os.path.join(os.path.dirname(__file__), path)
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def normalized_template_score(pix, template, radius, x, y):
-    vals = []
-    for yy in range(y - radius, y + radius + 1):
-        for xx in range(x - radius, x + radius + 1):
-            vals.append(brightness(pix[xx, yy]))
-    flat_template = [v for row in template for v in row]
-    mean_vals = sum(vals) / len(vals)
-    mean_template = sum(flat_template) / len(flat_template)
-    std_vals = math.sqrt(sum((v - mean_vals) ** 2 for v in vals)) + 1e-6
-    std_template = math.sqrt(sum((v - mean_template) ** 2 for v in flat_template)) + 1e-6
-    return sum((vals[i] - mean_vals) * (flat_template[i] - mean_template) for i in range(len(vals))) / (std_vals * std_template)
 
 
 def detect_overlay_vertices_template(field, box):
