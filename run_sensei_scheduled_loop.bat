@@ -5,10 +5,15 @@ set "SCRIPT_DIR=%~dp0"
 set "SCRIPT=%SCRIPT_DIR%sensei_click.py"
 set "DEBUG_DIR=%SCRIPT_DIR%debug_last"
 set "CONFIG=%SCRIPT_DIR%auto_fishing_start.json"
-set "BUNDLED_PY=C:\Users\libis\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+set "VENV_PY=%SCRIPT_DIR%.venv\Scripts\python.exe"
 
-if exist "%BUNDLED_PY%" (
-  "%BUNDLED_PY%" "%SCRIPT%" --scheduled-auto-loop --start-delay 4 --schedule-config "%CONFIG%" --start-wait-timeout 90 --start-poll-interval 0.25 --start-confirm-frames 2 --after-start-delay 0.2 --debug-dir "%DEBUG_DIR%" --no-start-button-debug-images --constellation-debug-images minimal-images
+if defined SENSEI_PYTHON (
+  "%SENSEI_PYTHON%" "%SCRIPT%" --scheduled-auto-loop --start-delay 4 --schedule-config "%CONFIG%" --start-wait-timeout 90 --start-poll-interval 0.25 --start-confirm-frames 2 --after-start-delay 0.2 --debug-dir "%DEBUG_DIR%" --no-start-button-debug-images --constellation-debug-images minimal-images
+  exit /b %errorlevel%
+)
+
+if exist "%VENV_PY%" (
+  "%VENV_PY%" "%SCRIPT%" --scheduled-auto-loop --start-delay 4 --schedule-config "%CONFIG%" --start-wait-timeout 90 --start-poll-interval 0.25 --start-confirm-frames 2 --after-start-delay 0.2 --debug-dir "%DEBUG_DIR%" --no-start-button-debug-images --constellation-debug-images minimal-images
   exit /b %errorlevel%
 )
 

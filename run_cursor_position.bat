@@ -3,10 +3,15 @@ setlocal
 
 set "SCRIPT_DIR=%~dp0"
 set "SCRIPT=%SCRIPT_DIR%sensei_click.py"
-set "BUNDLED_PY=C:\Users\libis\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+set "VENV_PY=%SCRIPT_DIR%.venv\Scripts\python.exe"
 
-if exist "%BUNDLED_PY%" (
-  "%BUNDLED_PY%" "%SCRIPT%" --print-cursor-on-f12
+if defined SENSEI_PYTHON (
+  "%SENSEI_PYTHON%" "%SCRIPT%" --print-cursor-on-f12
+  exit /b %errorlevel%
+)
+
+if exist "%VENV_PY%" (
+  "%VENV_PY%" "%SCRIPT%" --print-cursor-on-f12
   exit /b %errorlevel%
 )
 

@@ -19,6 +19,22 @@ The game also removes decoy stars as time passes. If confidence is low, the scri
 
 ## Run
 
+First set up the local Python environment:
+
+```powershell
+.\install.bat
+```
+
+This creates `.venv` in the repository and installs the packages from `requirements.txt`.
+The generated `.venv` folder is ignored by Git.
+
+After that, use the normal BAT files. They choose Python in this order:
+
+1. `SENSEI_PYTHON`, if set
+2. `.venv\Scripts\python.exe`, if created by `install.bat`
+3. `py -3`
+4. `python`
+
 Open the mini-game, run the BAT, and return focus to the game window during the startup delay:
 
 ```powershell
@@ -68,7 +84,7 @@ Print the detected movement without the final click:
 Move without clicking:
 
 ```powershell
-& 'C:\Users\libis\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' .\sensei_click.py --move-only
+.\.venv\Scripts\python.exe .\sensei_click.py --move-only
 ```
 
 ## Useful options
@@ -91,25 +107,25 @@ The old fixed rectangle for the original 1904x1006 screenshots was:
 If auto-detection fails, set it manually:
 
 ```powershell
-& 'C:\Users\libis\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' .\sensei_click.py --rect 663,282,592,286
+.\.venv\Scripts\python.exe .\sensei_click.py --rect 663,282,592,286
 ```
 
 To wait longer for decoy stars to disappear:
 
 ```powershell
-& 'C:\Users\libis\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' .\sensei_click.py --retry-until 14
+.\.venv\Scripts\python.exe .\sensei_click.py --retry-until 14
 ```
 
 To change the startup delay:
 
 ```powershell
-& 'C:\Users\libis\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' .\sensei_click.py --start-delay 4
+.\.venv\Scripts\python.exe .\sensei_click.py --start-delay 4
 ```
 
 To make the cursor sweep wider or narrower:
 
 ```powershell
-& 'C:\Users\libis\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' .\sensei_click.py --offsets "0,0;120,0;-120,0;0,90;0,-90"
+.\.venv\Scripts\python.exe .\sensei_click.py --offsets "0,0;120,0;-120,0;0,90;0,-90"
 ```
 
 ## Notes

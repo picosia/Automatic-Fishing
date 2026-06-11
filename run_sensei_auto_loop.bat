@@ -4,10 +4,15 @@ setlocal
 set "SCRIPT_DIR=%~dp0"
 set "SCRIPT=%SCRIPT_DIR%sensei_click.py"
 set "DEBUG_DIR=%SCRIPT_DIR%debug_last"
-set "BUNDLED_PY=C:\Users\libis\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
+set "VENV_PY=%SCRIPT_DIR%.venv\Scripts\python.exe"
 
-if exist "%BUNDLED_PY%" (
-  "%BUNDLED_PY%" "%SCRIPT%" --auto-loop --start-delay 1 --start-wait-timeout 90 --start-poll-interval 0.25 --start-confirm-frames 2 --after-start-delay 0.2 --debug-dir "%DEBUG_DIR%"
+if defined SENSEI_PYTHON (
+  "%SENSEI_PYTHON%" "%SCRIPT%" --auto-loop --start-delay 1 --start-wait-timeout 90 --start-poll-interval 0.25 --start-confirm-frames 2 --after-start-delay 0.2 --debug-dir "%DEBUG_DIR%"
+  exit /b %errorlevel%
+)
+
+if exist "%VENV_PY%" (
+  "%VENV_PY%" "%SCRIPT%" --auto-loop --start-delay 1 --start-wait-timeout 90 --start-poll-interval 0.25 --start-confirm-frames 2 --after-start-delay 0.2 --debug-dir "%DEBUG_DIR%"
   exit /b %errorlevel%
 )
 
