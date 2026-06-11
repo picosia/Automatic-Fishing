@@ -16,6 +16,11 @@ from PIL import Image, ImageDraw, ImageGrab
 DEFAULT_RECT = None
 DEFAULT_OFFSETS = "0,0;80,0;-80,0;0,-50;55,-35;-55,-35"
 DEFAULT_TEMPLATE_PATH = "vertex_template.json"
+DEFAULT_SCHEDULE_CONFIG_PATH = "auto_fishing_start.json"
+SCHEDULE_START_ET = 18 * 3600 + 10 * 60
+SCHEDULE_END_ET = 5 * 3600 + 50 * 60
+ET_SPEED = 40
+VK_F12 = 0x7B
 
 
 @dataclass
@@ -45,6 +50,10 @@ class DetectionResult:
 VERTEX_TEMPLATE = None
 
 
+class SessionWindowEnded(Exception):
+    pass
+
+
 def enable_dpi_awareness():
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -63,6 +72,8 @@ class DebugLog:
         self.enabled = bool(root)
         self.root = None
         self.lines = []
+        self.deferred_images = []
+        self.max_deferred_images = 120
         if self.enabled:
             stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
             self.root = os.path.join(root, stamp)
@@ -74,9 +85,24 @@ class DebugLog:
         if self.enabled:
             print(f"debug: {text}")
 
-    def save_image(self, name, image):
+    def save_image(self, name, image, defer=False):
+        if not self.enabled:
+            return
+        if defer:
+            self.deferred_images.append((name, image.copy()))
+            if len(self.deferred_images) > self.max_deferred_images:
+                self.deferred_images = self.deferred_images[-self.max_deferred_images :]
+            return
+        image.save(os.path.join(self.root, name))
+
+    def flush_deferred_images(self):
         if self.enabled:
-            image.save(os.path.join(self.root, name))
+            for name, image in self.deferred_images:
+                image.save(os.path.join(self.root, name))
+        self.deferred_images.clear()
+
+    def clear_deferred_images(self):
+        self.deferred_images.clear()
 
     def save_text(self):
         if self.enabled:
@@ -120,6 +146,98 @@ def field_stats(field):
 
 def clamp(value, lo, hi):
     return max(lo, min(hi, value))
+
+
+def erin_time_seconds(now=None):
+    if now is None:
+        now = dt.datetime.now()
+    rt_sec = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1_000_000
+    return (rt_sec * ET_SPEED) % 86400
+
+
+def format_et(seconds=None):
+    if seconds is None:
+        seconds = erin_time_seconds()
+    seconds = int(seconds) % 86400
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def et_seconds_until(target_sec):
+    current = erin_time_seconds()
+    delta = (target_sec - current) % 86400
+    return delta / ET_SPEED
+
+
+def is_scheduled_window_open():
+    current = erin_time_seconds()
+    return current >= SCHEDULE_START_ET or current < SCHEDULE_END_ET
+
+
+def parse_click_points(value):
+    points = []
+    if not value:
+        return points
+    for chunk in value.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [part.strip() for part in chunk.split(",")]
+        if len(parts) != 2:
+            raise argparse.ArgumentTypeError(f"invalid click point: {chunk}")
+        points.append((float(parts[0]), float(parts[1])))
+    return points
+
+
+def load_session_start_clicks(path, override):
+    if override:
+        return override
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    raw_points = data.get("session_start_clicks")
+    if not isinstance(raw_points, list):
+        raise RuntimeError(f"{path}: session_start_clicks must be a list")
+    points = []
+    for index, item in enumerate(raw_points):
+        if isinstance(item, dict):
+            x, y = item.get("x"), item.get("y")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            x, y = item
+        else:
+            raise RuntimeError(f"{path}: session_start_clicks[{index}] must be [x, y] or {{\"x\": x, \"y\": y}}")
+        points.append((float(x), float(y)))
+    if len(points) != 2:
+        raise RuntimeError(f"{path}: exactly two session_start_clicks are required")
+    if any(x == 0 and y == 0 for x, y in points):
+        raise RuntimeError(f"{path}: replace the placeholder 0,0 session start coordinates before running scheduled mode")
+    return points
+
+
+def click_point(point, repeat, interval):
+    x, y = point
+    Mouse.move_to(x, y)
+    time.sleep(0.08)
+    for index in range(repeat):
+        Mouse.click()
+        if index + 1 < repeat:
+            time.sleep(interval)
+
+
+def wait_for_f12_cursor_printer():
+    print("Move the cursor to the target position and press F12. Press Ctrl+C to stop.")
+    was_down = False
+    try:
+        while True:
+            down = bool(ctypes.windll.user32.GetAsyncKeyState(VK_F12) & 0x8000)
+            if down and not was_down:
+                x, y = Mouse.pos()
+                print(f"{x},{y}")
+            was_down = down
+            time.sleep(0.03)
+    except KeyboardInterrupt:
+        return 0
 
 
 def is_border_pixel(r, g, b):
@@ -166,8 +284,62 @@ def looks_like_star_field_below(screen, x0, x1, y):
     return total > 0 and hits / total >= 0.55
 
 
+def looks_like_star_field_area(screen, x0, y0, x1, y1):
+    if x0 < 0 or y0 < 0 or x1 >= screen.width or y1 >= screen.height:
+        return False
+    pix = screen.load()
+    total = 0
+    dark_hits = 0
+    blue_hits = 0
+    for y in range(y0 + 20, y1 - 20, 8):
+        for x in range(x0 + 20, x1 - 20, 8):
+            r, g, b = pix[x, y]
+            total += 1
+            if r < 95 and g < 105 and b < 145:
+                dark_hits += 1
+            if b > r + 5 and b >= g:
+                blue_hits += 1
+    return total > 0 and dark_hits / total >= 0.80 and blue_hits / total >= 0.60
+
+
+def find_minigame_modal_frames(screen, runs):
+    frames = []
+    for i, (modal_y, modal_x0, modal_x1, modal_len) in enumerate(runs):
+        if not 600 <= modal_len <= 680:
+            continue
+        if not int(screen.height * 0.18) <= modal_y <= int(screen.height * 0.45):
+            continue
+        for bottom_y, bottom_x0, bottom_x1, bottom_len in runs[i + 1:]:
+            modal_height = bottom_y - modal_y + 1
+            if not 430 <= modal_height <= 500:
+                continue
+            if not 580 <= bottom_len <= 680:
+                continue
+            frames.append((modal_y, modal_x0, modal_x1, bottom_y))
+    return frames
+
+
+def matches_modal_expected_field(modal_frames, x0, top_y, x1, bottom_y):
+    if not modal_frames:
+        return True
+    width = x1 - x0 + 1
+    for modal_y, modal_x0, modal_x1, _ in modal_frames:
+        expected_x0 = modal_x0 + 36
+        expected_x1 = modal_x1 - 35
+        expected_top = modal_y + 82
+        expected_bottom = expected_top + 288
+        expected_width = expected_x1 - expected_x0 + 1
+        overlap = min(x1, expected_x1) - max(x0, expected_x0) + 1
+        if overlap < min(width, expected_width) * 0.65:
+            continue
+        if abs(top_y - expected_top) <= 18 and abs(bottom_y - expected_bottom) <= 18:
+            return True
+    return False
+
+
 def auto_detect_rect(screen):
     runs = longest_border_runs(screen)
+    modal_frames = find_minigame_modal_frames(screen, runs)
     best = None
     for i, (top_y, top_x0, top_x1, top_len) in enumerate(runs):
         for bottom_y, bottom_x0, bottom_x1, bottom_len in runs[i + 1:]:
@@ -178,6 +350,8 @@ def auto_detect_rect(screen):
             x1 = min(top_x1, bottom_x1)
             width = x1 - x0 + 1
             if not 500 <= width <= 650:
+                continue
+            if not matches_modal_expected_field(modal_frames, x0, top_y, x1, bottom_y):
                 continue
             # Prefer the constellation field dimensions seen in the game UI.
             score = 1000 - abs(width - 553) * 2 - abs(height - 289) * 3
@@ -196,6 +370,8 @@ def auto_detect_rect(screen):
                 continue
             x0, x1 = top_x0, top_x1
             bottom_y = min(screen.height - 1, top_y + 288)
+            if not matches_modal_expected_field(modal_frames, x0, top_y, x1, bottom_y):
+                continue
             score = 850 - abs(top_len - 553) * 2 - abs((bottom_y - top_y + 1) - 289) * 3
             if best is None or score > best[0]:
                 best = (score, x0, top_y, x1, bottom_y)
@@ -218,9 +394,39 @@ def auto_detect_rect(screen):
                 top_y = bottom_y - 288
                 if top_y <= modal_y + 35:
                     continue
+                if not matches_modal_expected_field(modal_frames, x0, top_y, x1, bottom_y):
+                    continue
                 if not looks_like_star_field_below(screen, x0, x1, top_y):
                     continue
                 score = 820 - abs(bottom_len - 553) * 2 - abs(height - 366) * 2
+                if best is None or score > best[0]:
+                    best = (score, x0, top_y, x1, bottom_y)
+    if best is None:
+        # Last-resort inference from the full mini-game modal frame. The star
+        # field size is stable, but the field's own border can be hidden by a
+        # large constellation or by the daytime background brightness.
+        for i, (modal_y, modal_x0, modal_x1, modal_len) in enumerate(runs):
+            if not 600 <= modal_len <= 680:
+                continue
+            if not int(screen.height * 0.18) <= modal_y <= int(screen.height * 0.45):
+                continue
+            for bottom_y, bottom_x0, bottom_x1, bottom_len in runs[i + 1:]:
+                modal_height = bottom_y - modal_y + 1
+                if not 430 <= modal_height <= 500:
+                    continue
+                if not 580 <= bottom_len <= 680:
+                    continue
+                x0 = modal_x0 + 36
+                x1 = modal_x1 - 35
+                top_y = modal_y + 82
+                bottom_y = top_y + 288
+                width = x1 - x0 + 1
+                height = bottom_y - top_y + 1
+                if not 520 <= width <= 580 or height != 289:
+                    continue
+                if not looks_like_star_field_area(screen, x0, top_y, x1, bottom_y):
+                    continue
+                score = 760 - abs(width - 553) * 2 - abs(modal_height - 464) * 2
                 if best is None or score > best[0]:
                     best = (score, x0, top_y, x1, bottom_y)
     if best is None:
@@ -478,7 +684,7 @@ def detect_overlay_and_stars(field, allow_clipped=False):
     return FrameData(overlay=overlay, stars=stars, overlay_box=box, magenta_centroid=centroid)
 
 
-def save_detection_debug(debug, label, field, frame):
+def save_detection_debug(debug, label, field, frame, defer=False):
     if not debug or not debug.enabled:
         return
     marked = field.copy()
@@ -490,10 +696,10 @@ def save_detection_debug(debug, label, field, frame):
         r = 6
         draw.ellipse((p.x - r, p.y - r, p.x + r, p.y + r), outline=(255, 40, 40), width=2)
         draw.text((p.x + 7, p.y - 7), str(index), fill=(255, 80, 80))
-    debug.save_image(f"{label}_detected.png", marked)
+    debug.save_image(f"{label}_detected.png", marked, defer=defer)
 
 
-def save_match_debug(debug, label, field, frame, stars, best):
+def save_match_debug(debug, label, field, frame, stars, best, defer=False):
     if not debug or not debug.enabled:
         return
     _, _, dx, dy, _, _, _ = best
@@ -512,7 +718,7 @@ def save_match_debug(debug, label, field, frame, stars, best):
             sx, sy = min(star_points, key=lambda s: (s[0] - tx) * (s[0] - tx) + (s[1] - ty) * (s[1] - ty))
             if (sx - tx) * (sx - tx) + (sy - ty) * (sy - ty) <= 11.0 * 11.0:
                 draw.line((tx, ty, sx, sy), fill=(255, 255, 0), width=1)
-    debug.save_image(f"{label}_match.png", marked)
+    debug.save_image(f"{label}_match.png", marked, defer=defer)
 
 
 def find_translation(overlay, stars, tolerance):
@@ -584,21 +790,25 @@ def resolve_rect(screen, rect):
     return auto_detect_rect(screen) if rect is None else rect
 
 
-def grab_field(rect, debug=None, label=None, save_full=False, screen=None):
+def grab_field(rect, debug=None, label=None, save_full=False, screen=None, defer=False):
     if screen is None:
         screen = grab_screen()
     rect = resolve_rect(screen, rect)
     rx, ry, rw, rh = rect
     field = screen.crop((rx, ry, rx + rw, ry + rh))
     if debug and debug.enabled and label:
-        debug.save_image(f"{label}_field.png", field)
+        debug.save_image(f"{label}_field.png", field, defer=defer)
         if save_full:
             marked = screen.copy()
             draw = ImageDraw.Draw(marked)
             draw.rectangle((rx, ry, rx + rw, ry + rh), outline=(255, 0, 0), width=3)
-            debug.save_image(f"{label}_full.png", marked)
+            debug.save_image(f"{label}_full.png", marked, defer=defer)
         debug.log(f"{label}: mouse={Mouse.pos()} rect={rect} stats={field_stats(field)}")
     return field
+
+
+def defer_constellation_images(args):
+    return getattr(args, "constellation_debug_images", "full-images") in ("minimal", "minimal-images")
 
 
 def load_image_field(path, rect):
@@ -628,11 +838,15 @@ def parse_offsets(text):
 
 
 def required_match_count(overlay_count, min_matches, min_coverage):
-    if overlay_count <= 4:
+    if overlay_count <= 3:
         return overlay_count
-    if overlay_count <= 9:
+    if overlay_count <= 8:
         return overlay_count - 1
-    return overlay_count - 2
+    if overlay_count <= 12:
+        return overlay_count - 2
+    if overlay_count <= 16:
+        return overlay_count - 3
+    return overlay_count - 4
 
 
 def confidence_ok(best, overlay_count, min_matches, min_coverage):
@@ -652,6 +866,7 @@ def analyze_static_image(args):
 def sample_live(args, debug=None, attempt=0):
     rect = args.rect
     rx, ry, rw, rh = rect
+    defer_images = defer_constellation_images(args)
     if debug and debug.enabled:
         debug.log(f"attempt{attempt:02d}: resolved_rect={rect}")
     if args.base == "center":
@@ -670,7 +885,13 @@ def sample_live(args, debug=None, attempt=0):
         nonlocal start_x, start_y
         for round_index in range(3):
             label = f"{prefix}" if round_index == 0 else f"{prefix}_precentered{round_index}"
-            field_for_center = grab_field(rect, debug, label, save_full=(save_first_full and round_index == 0))
+            field_for_center = grab_field(
+                rect,
+                debug,
+                label,
+                save_full=(save_first_full and round_index == 0),
+                defer=defer_images,
+            )
             try:
                 frame_for_center = detect_overlay_and_stars(field_for_center, allow_clipped=True)
                 bx0, by0, bx1, by1 = frame_for_center.overlay_box
@@ -736,7 +957,7 @@ def sample_live(args, debug=None, attempt=0):
         Mouse.move_to(start_x + dx, start_y + dy)
         time.sleep(args.settle)
         label = f"attempt{attempt:02d}_sweep{index:02d}_{int(dx)}_{int(dy)}"
-        field = grab_field(rect, debug, label)
+        field = grab_field(rect, debug, label, defer=defer_images)
         try:
             frame = detect_overlay_and_stars(field)
         except Exception as exc:
@@ -745,7 +966,7 @@ def sample_live(args, debug=None, attempt=0):
             if debug and debug.enabled:
                 debug.log(f"{label}: skipped={exc}")
             continue
-        save_detection_debug(debug, label, field, frame)
+        save_detection_debug(debug, label, field, frame, defer=defer_images)
         if debug and debug.enabled:
             debug.log(f"{label}: overlay={len(frame.overlay)} stars={len(frame.stars)} box={frame.overlay_box}")
         if dx == 0 and dy == 0 and base_frame is None:
@@ -763,10 +984,10 @@ def sample_live(args, debug=None, attempt=0):
     Mouse.move_to(start_x, start_y)
     time.sleep(args.settle)
     label = f"attempt{attempt:02d}_current"
-    field = grab_field(rect, debug, label)
+    field = grab_field(rect, debug, label, defer=defer_images)
     try:
         current = detect_overlay_and_stars(field)
-        save_detection_debug(debug, label, field, current)
+        save_detection_debug(debug, label, field, current, defer=defer_images)
         if debug and debug.enabled:
             debug.log(f"{label}: overlay={len(current.overlay)} stars={len(current.stars)} box={current.overlay_box}")
         frames.append(current)
@@ -815,7 +1036,7 @@ def sample_live(args, debug=None, attempt=0):
     if debug and debug.enabled:
         debug.log(f"attempt{attempt:02d}: motion_gain=({gain_x:.3f},{gain_y:.3f}) samples_x={motion_samples_x} samples_y={motion_samples_y}")
         debug.log(f"attempt{attempt:02d}: merged_stars={len(stars)} best={best}")
-        save_match_debug(debug, f"attempt{attempt:02d}_current", field, current, stars, best)
+        save_match_debug(debug, f"attempt{attempt:02d}_current", field, current, stars, best, defer=defer_images)
     return DetectionResult(current, stars, best, len(frames), (gain_x, gain_y))
 
 
@@ -834,14 +1055,15 @@ def print_result(mode, frame, stars, best, frames=1):
 
 
 def move_to_target_with_verify(args, debug, stars, motion_gain, nx, ny, label):
+    defer_images = defer_constellation_images(args)
     Mouse.move_to(nx, ny)
     time.sleep(max(args.settle * 2, 0.10))
-    field = grab_field(args.rect, debug, f"{label}_after_move")
+    field = grab_field(args.rect, debug, f"{label}_after_move", defer=defer_images)
     try:
         frame = detect_overlay_and_stars(field, allow_clipped=True)
         residual = find_translation(frame.overlay, stars, args.tolerance)
-        save_detection_debug(debug, f"{label}_after_move", field, frame)
-        save_match_debug(debug, f"{label}_after_move", field, frame, stars, residual)
+        save_detection_debug(debug, f"{label}_after_move", field, frame, defer=defer_images)
+        save_match_debug(debug, f"{label}_after_move", field, frame, stars, residual, defer=defer_images)
         required = required_match_count(len(frame.overlay), args.min_matches, args.min_coverage)
         if debug.enabled:
             debug.log(
@@ -1014,6 +1236,8 @@ def wait_and_click_auto_fish(args, debug, loop_index):
     stable_found = None
     stable_count = 0
     while time.monotonic() < deadline:
+        if getattr(args, "stop_wait_at_schedule_end", False) and not is_scheduled_window_open():
+            raise SessionWindowEnded(f"scheduled ET window ended while waiting for start button: ET {format_et()}")
         screen = grab_screen()
         found = find_auto_fish_button(screen)
         if found:
@@ -1036,10 +1260,6 @@ def wait_and_click_auto_fish(args, debug, loop_index):
                 time.sleep(args.start_poll_interval)
                 continue
             if debug.enabled:
-                marked = screen.copy()
-                draw = ImageDraw.Draw(marked)
-                draw.rectangle(box, outline=(255, 0, 0), width=3)
-                debug.save_image(f"loop{loop_index:03d}_start_button.png", marked)
                 debug.log(
                     f"loop{loop_index:03d}: start_button box={box} click=({x:.0f},{y:.0f}) "
                     f"stable={stable_count}/{args.start_confirm_frames}"
@@ -1048,21 +1268,29 @@ def wait_and_click_auto_fish(args, debug, loop_index):
                 Mouse.move_to(x, y)
                 time.sleep(0.08)
                 actual_x, actual_y = Mouse.pos()
+                Mouse.click()
                 if debug.enabled:
-                    marked = screen.copy()
-                    draw = ImageDraw.Draw(marked)
-                    draw.rectangle(box, outline=(255, 0, 0), width=3)
-                    draw.line((actual_x - 12, actual_y, actual_x + 12, actual_y), fill=(0, 255, 0), width=2)
-                    draw.line((actual_x, actual_y - 12, actual_x, actual_y + 12), fill=(0, 255, 0), width=2)
-                    debug.save_image(f"loop{loop_index:03d}_start_click_pos.png", marked)
                     debug.log(
                         f"loop{loop_index:03d}: start_click target=({x:.0f},{y:.0f}) "
                         f"actual=({actual_x},{actual_y}) delta=({actual_x - x:.1f},{actual_y - y:.1f})"
                     )
+                    if not args.no_start_button_debug_images:
+                        marked = screen.copy()
+                        draw = ImageDraw.Draw(marked)
+                        draw.rectangle(box, outline=(255, 0, 0), width=3)
+                        debug.save_image(f"loop{loop_index:03d}_start_button.png", marked)
+                        draw.line((actual_x - 12, actual_y, actual_x + 12, actual_y), fill=(0, 255, 0), width=2)
+                        draw.line((actual_x, actual_y - 12, actual_x, actual_y + 12), fill=(0, 255, 0), width=2)
+                        debug.save_image(f"loop{loop_index:03d}_start_click_pos.png", marked)
                     debug.save_text()
-                Mouse.click()
             else:
                 print(f"DRY-RUN start: would click auto-fish button at ({x:.0f},{y:.0f})")
+                if debug.enabled and not args.no_start_button_debug_images:
+                    marked = screen.copy()
+                    draw = ImageDraw.Draw(marked)
+                    draw.rectangle(box, outline=(255, 0, 0), width=3)
+                    debug.save_image(f"loop{loop_index:03d}_start_button.png", marked)
+                    debug.save_text()
             return True
         stable_found = None
         stable_count = 0
@@ -1099,7 +1327,11 @@ def wait_for_star_field(args, debug, loop_index):
                 draw = ImageDraw.Draw(marked)
                 rx, ry, rw, rh = rect
                 draw.rectangle((rx, ry, rx + rw, ry + rh), outline=(255, 0, 0), width=3)
-                debug.save_image(f"loop{loop_index:03d}_star_field_ready.png", marked)
+                debug.save_image(
+                    f"loop{loop_index:03d}_star_field_ready.png",
+                    marked,
+                    defer=defer_constellation_images(args),
+                )
                 debug.log(f"loop{loop_index:03d}: star_field_ready rect={rect}")
                 debug.save_text()
             return rect
@@ -1118,7 +1350,9 @@ def wait_for_star_field(args, debug, loop_index):
     raise RuntimeError(f"star field did not appear after start click: {last_error}")
 
 
-def run_constellation_once(args, debug):
+def run_constellation_once(args, debug, clear_deferred_at_start=True):
+    if clear_deferred_at_start and defer_constellation_images(args):
+        debug.clear_deferred_images()
     args.rect = resolve_rect(grab_screen(), args.rect)
     if debug.enabled:
         debug.log(f"locked_rect={args.rect}")
@@ -1149,6 +1383,8 @@ def run_constellation_once(args, debug):
                     debug.save_text()
                 if args.dry_run:
                     print(f"DRY-RUN success: would move to ({nx:.0f},{ny:.0f}) and click")
+                    if defer_constellation_images(args):
+                        debug.clear_deferred_images()
                     return 0
                 if not move_to_target_with_verify(args, debug, stars, result.motion_gain, nx, ny, f"attempt{attempt:02d}_final"):
                     last_error = "final move verification failed"
@@ -1158,6 +1394,8 @@ def run_constellation_once(args, debug):
                 debug.save_text()
                 if not args.move_only:
                     Mouse.click()
+                if defer_constellation_images(args):
+                    debug.clear_deferred_images()
                 return 0
             last_error = "low confidence"
             if debug.enabled:
@@ -1168,10 +1406,94 @@ def run_constellation_once(args, debug):
                 debug.log(f"attempt{attempt:02d}: error={last_error}")
 
         if time.monotonic() >= deadline:
+            if defer_constellation_images(args):
+                debug.flush_deferred_images()
             debug.save_text()
             raise RuntimeError(f"gave up before confident click: {last_error}")
         time.sleep(args.retry_interval)
         attempt += 1
+
+
+def run_auto_loop_cycle(args, debug, loop_index):
+    if debug.enabled:
+        debug.log(f"loop{loop_index:03d}: begin")
+    try:
+        wait_and_click_auto_fish(args, debug, loop_index)
+        move_to_expected_star_field_center(args, debug, loop_index)
+        time.sleep(args.after_start_delay)
+        if defer_constellation_images(args):
+            debug.clear_deferred_images()
+        args.rect = wait_for_star_field(args, debug, loop_index)
+        run_constellation_once(args, debug, clear_deferred_at_start=False)
+        if debug.enabled:
+            debug.log(f"loop{loop_index:03d}: complete")
+            debug.save_text()
+    except SessionWindowEnded:
+        raise
+    except Exception as exc:
+        if debug.enabled:
+            debug.log(f"loop{loop_index:03d}: skipped_after_error={exc}")
+            debug.save_text()
+        print(f"loop{loop_index:03d}: skipped after error: {exc}")
+
+
+def run_auto_loop(args, debug, loop_index=0):
+    while args.loop_count <= 0 or loop_index < args.loop_count:
+        run_auto_loop_cycle(args, debug, loop_index)
+        loop_index += 1
+        time.sleep(0.5)
+    return loop_index
+
+
+def start_scheduled_session(args, debug, session_index):
+    clicks = load_session_start_clicks(args.schedule_config, args.session_start_clicks)
+    print(f"session{session_index:03d}: starting ET {format_et()} with configured clicks")
+    if debug.enabled:
+        debug.log(f"session{session_index:03d}: start_clicks={clicks} ET={format_et()}")
+    if args.dry_run:
+        print(f"DRY-RUN session start: would click {clicks[0]} x{args.session_start_click_repeat}, wait {args.session_start_between_delay:.1f}s, click {clicks[1]} x{args.session_start_click_repeat}")
+        return
+    click_point(clicks[0], args.session_start_click_repeat, args.session_start_repeat_interval)
+    time.sleep(args.session_start_between_delay)
+    click_point(clicks[1], args.session_start_click_repeat, args.session_start_repeat_interval)
+    if debug.enabled:
+        debug.log(f"session{session_index:03d}: start_clicks_done ET={format_et()} mouse={Mouse.pos()}")
+        debug.save_text()
+
+
+def run_scheduled_auto_loop(args, debug):
+    print("Scheduled auto-loop mode. Focus the game window now; press Ctrl+C in this console to stop.")
+    if args.start_delay > 0:
+        print(f"Starting scheduler in {args.start_delay:.1f}s. Focus the game window now.")
+        time.sleep(args.start_delay)
+
+    session_index = 0
+    loop_index = 0
+    while args.session_count <= 0 or session_index < args.session_count:
+        if not is_scheduled_window_open():
+            wait_seconds = et_seconds_until(SCHEDULE_START_ET)
+            print(f"session{session_index:03d}: waiting for ET 18:10. current ET {format_et()}, RT wait {wait_seconds:.1f}s")
+            if debug.enabled:
+                debug.log(f"session{session_index:03d}: waiting_for_start ET={format_et()} wait_rt={wait_seconds:.1f}s")
+                debug.save_text()
+            time.sleep(wait_seconds)
+
+        start_scheduled_session(args, debug, session_index)
+        args.stop_wait_at_schedule_end = True
+        while True:
+            try:
+                run_auto_loop_cycle(args, debug, loop_index)
+            except SessionWindowEnded as exc:
+                print(f"session{session_index:03d}: ended: {exc}")
+                if debug.enabled:
+                    debug.log(f"session{session_index:03d}: ended={exc}")
+                    debug.save_text()
+                loop_index += 1
+                break
+            loop_index += 1
+            time.sleep(0.5)
+        session_index += 1
+    return 0
 
 
 def main():
@@ -1194,13 +1516,23 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Print detection result without moving/clicking to the final position")
     parser.add_argument("--move-only", action="store_true", help="Move mouse to the detected position without clicking")
     parser.add_argument("--debug-dir", help="Save captured fields and log files under this directory")
+    parser.add_argument("--constellation-debug-images", choices=("full-images", "minimal-images", "full", "minimal"), default="full-images", help="full-images saves every constellation debug image; minimal-images saves constellation images only when the solve is abandoned")
     parser.add_argument("--vertex-template", default=DEFAULT_TEMPLATE_PATH, help="Learned vertex template JSON")
+    parser.add_argument("--print-cursor-on-f12", action="store_true", help="Print the current cursor position whenever F12 is pressed")
     parser.add_argument("--auto-loop", action="store_true", help="Wait for the fishing prompt, click the start button, clear the constellation, and repeat")
+    parser.add_argument("--scheduled-auto-loop", action="store_true", help="Use ET 18:10-05:50 scheduling, start the fishing session, and run auto-loop during the ET window")
+    parser.add_argument("--schedule-config", default=DEFAULT_SCHEDULE_CONFIG_PATH, help="JSON file containing scheduled session start click positions")
+    parser.add_argument("--session-start-clicks", type=parse_click_points, help="Override scheduled start click points: x,y;x,y")
+    parser.add_argument("--session-start-click-repeat", type=int, default=2, help="Click each scheduled start point this many times")
+    parser.add_argument("--session-start-repeat-interval", type=float, default=0.12, help="Seconds between repeated clicks on the same scheduled start point")
+    parser.add_argument("--session-start-between-delay", type=float, default=4.0, help="Seconds between the first and second scheduled start click points")
+    parser.add_argument("--session-count", type=int, default=0, help="Number of scheduled ET sessions. 0 means run until stopped")
     parser.add_argument("--loop-count", type=int, default=0, help="Number of auto-loop cycles. 0 means run until stopped")
     parser.add_argument("--start-wait-timeout", type=float, default=90.0, help="Seconds to wait for the fishing start prompt in auto-loop mode")
     parser.add_argument("--start-poll-interval", type=float, default=0.25, help="Seconds between start prompt checks")
     parser.add_argument("--start-confirm-frames", type=int, default=2, help="Require this many consecutive start button detections before clicking")
     parser.add_argument("--start-confirm-distance", type=float, default=6.0, help="Maximum pixel drift allowed between consecutive start button detections")
+    parser.add_argument("--no-start-button-debug-images", action="store_true", help="Do not save full-screen debug images for the auto-fish start button")
     parser.add_argument("--after-start-delay", type=float, default=0.2, help="Seconds to wait after clicking the fishing start button before solving the constellation")
     parser.add_argument("--field-wait-timeout", type=float, default=5.0, help="Seconds to wait for the constellation field after clicking the fishing start button")
     parser.add_argument("--field-poll-interval", type=float, default=0.10, help="Seconds between constellation field checks after the start click")
@@ -1210,36 +1542,23 @@ def main():
     if debug.enabled and VERTEX_TEMPLATE:
         debug.log(f"vertex_template={args.vertex_template} threshold={VERTEX_TEMPLATE.get('threshold')} radius={VERTEX_TEMPLATE.get('radius')}")
 
+    if args.print_cursor_on_f12:
+        return wait_for_f12_cursor_printer()
+
     if args.image:
         best, frame = analyze_static_image(args)
         if not confidence_ok(best, len(frame.overlay), args.min_matches, args.min_coverage):
             raise RuntimeError("static image confidence is low")
         return 0
 
+    if args.scheduled_auto_loop:
+        return run_scheduled_auto_loop(args, debug)
+
     if args.auto_loop:
         print("Auto-loop mode. Focus the game window now; press Ctrl+C in this console to stop.")
         if args.start_delay > 0:
             time.sleep(args.start_delay)
-        loop_index = 0
-        while args.loop_count <= 0 or loop_index < args.loop_count:
-            if debug.enabled:
-                debug.log(f"loop{loop_index:03d}: begin")
-            try:
-                wait_and_click_auto_fish(args, debug, loop_index)
-                move_to_expected_star_field_center(args, debug, loop_index)
-                time.sleep(args.after_start_delay)
-                args.rect = wait_for_star_field(args, debug, loop_index)
-                run_constellation_once(args, debug)
-                if debug.enabled:
-                    debug.log(f"loop{loop_index:03d}: complete")
-                    debug.save_text()
-            except Exception as exc:
-                if debug.enabled:
-                    debug.log(f"loop{loop_index:03d}: skipped_after_error={exc}")
-                    debug.save_text()
-                print(f"loop{loop_index:03d}: skipped after error: {exc}")
-            loop_index += 1
-            time.sleep(0.5)
+        run_auto_loop(args, debug)
         return 0
 
     if args.start_delay > 0:

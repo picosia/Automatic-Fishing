@@ -39,6 +39,24 @@ To wait for the fishing prompt, click `自分で釣る`, clear the constellation
 
 Stop the loop with `Ctrl+C` in the console.
 
+## Scheduled loop
+
+To run across game-time sessions, first collect the two fixed start coordinates:
+
+```powershell
+.\run_cursor_position.bat
+```
+
+Move the cursor to each target and press `F12`; write the printed coordinates into `auto_fishing_start.json`.
+
+Then run:
+
+```powershell
+.\run_sensei_scheduled_loop.bat
+```
+
+This waits for ET `18:10`, clicks the two configured start points, runs the auto loop while waiting for `自分で釣る`, and ends the session only while waiting for the next `自分で釣る` after ET `05:50`. If started during the active ET window, it begins after the startup delay.
+
 ## Dry run
 
 Print the detected movement without the final click:
@@ -118,3 +136,17 @@ If detection fails, check or share:
 - the latest `*_field.png` files
 
 The full image has a red rectangle showing the area the script is cropping as the star field.
+
+Constellation debug image saving can be changed with:
+
+```text
+--constellation-debug-images full-images
+--constellation-debug-images minimal-images
+```
+
+`full-images` is the default and saves images as before. `minimal-images` keeps constellation debug images in memory during successful solves and writes them only when the solver gives up on that mini-game.
+
+## Scheduled BAT variants
+
+- `run_sensei_scheduled_loop.bat`: long unattended run mode. Start-button debug images are disabled, and constellation debug images are saved only when a mini-game solve is abandoned.
+- `run_sensei_scheduled_loop_save-img.bat`: testing mode. Keeps the full debug image behavior.
