@@ -73,6 +73,38 @@ Then run:
 
 This waits for ET `18:10`, clicks the two configured start points, runs the auto loop while waiting for `自分で釣る`, and ends the session only while waiting for the next `自分で釣る` after ET `05:50`. If started during the active ET window, it begins after the startup delay.
 
+## GUI launcher
+
+The development GUI launcher starts and stops the same scheduled loop used by `run_sensei_scheduled_loop.bat`:
+
+```powershell
+.\.venv\Scripts\python.exe .\sensei_gui.py
+```
+
+Use `Start` to begin the scheduled loop and `Stop` to terminate it. If the game is running as administrator, run the GUI as administrator too.
+
+## Build GUI exe
+
+Install the normal runtime dependencies first:
+
+```powershell
+.\install.bat
+```
+
+Then build the development onedir executable:
+
+```powershell
+.\build_gui_exe.bat
+```
+
+The executable is written under:
+
+```text
+dist\SenseiFishing\SenseiFishing.exe
+```
+
+Run the exe as administrator when the game is running as administrator.
+
 ## Dry run
 
 Print the detected movement without the final click:

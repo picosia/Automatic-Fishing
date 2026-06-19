@@ -1219,11 +1219,14 @@ def find_auto_fish_button_fallback(screen, x0, x1, y0, y1):
     return boxes
 
 
-def wait_and_click_auto_fish(args, debug, loop_index):
-    deadline = time.monotonic() + args.start_wait_timeout
+def wait_and_click_auto_fish(args, debug, loop_index, timeout=None, context="start"):
+    if timeout is None:
+        timeout = args.start_wait_timeout
+    deadline = time.monotonic() + timeout
     last_seen = None
     stable_found = None
     stable_count = 0
+    event_prefix = "" if context == "start" else f"{context}_"
     while time.monotonic() < deadline:
         if getattr(args, "stop_wait_at_schedule_end", False) and not is_scheduled_window_open():
             raise SessionWindowEnded(f"scheduled ET window ended while waiting for start button: ET {format_et()}")
@@ -1243,14 +1246,14 @@ def wait_and_click_auto_fish(args, debug, loop_index):
             if stable_count < args.start_confirm_frames:
                 if debug.enabled:
                     debug.log(
-                        f"loop{loop_index:03d}: start_button candidate "
+                        f"loop{loop_index:03d}: {event_prefix}start_button candidate "
                         f"box={box} click=({x:.0f},{y:.0f}) stable={stable_count}/{args.start_confirm_frames}"
                     )
                 time.sleep(args.start_poll_interval)
                 continue
             if debug.enabled:
                 debug.log(
-                    f"loop{loop_index:03d}: start_button box={box} click=({x:.0f},{y:.0f}) "
+                    f"loop{loop_index:03d}: {event_prefix}start_button box={box} click=({x:.0f},{y:.0f}) "
                     f"stable={stable_count}/{args.start_confirm_frames}"
                 )
             if not args.dry_run:
@@ -1260,7 +1263,7 @@ def wait_and_click_auto_fish(args, debug, loop_index):
                 Mouse.click()
                 if debug.enabled:
                     debug.log(
-                        f"loop{loop_index:03d}: start_click target=({x:.0f},{y:.0f}) "
+                        f"loop{loop_index:03d}: {event_prefix}start_click target=({x:.0f},{y:.0f}) "
                         f"actual=({actual_x},{actual_y}) delta=({actual_x - x:.1f},{actual_y - y:.1f})"
                     )
                     if not args.no_start_button_debug_images:
@@ -1286,7 +1289,7 @@ def wait_and_click_auto_fish(args, debug, loop_index):
         if last_seen is None or time.monotonic() - last_seen > 2.0:
             last_seen = time.monotonic()
             if debug.enabled:
-                debug.log(f"loop{loop_index:03d}: waiting for start button")
+                debug.log(f"loop{loop_index:03d}: waiting for {event_prefix}start button")
         time.sleep(args.start_poll_interval)
     raise RuntimeError("start button was not detected before timeout")
 
@@ -1303,8 +1306,8 @@ def move_to_expected_star_field_center(args, debug, loop_index):
         debug.log(f"loop{loop_index:03d}: moved_to_expected_field_center target=({x:.0f},{y:.0f}) actual={Mouse.pos()}")
 
 
-def wait_for_star_field(args, debug, loop_index):
-    deadline = time.monotonic() + args.field_wait_timeout
+def wait_for_star_field_once(args, debug, loop_index, timeout):
+    deadline = time.monotonic() + timeout
     last_seen = None
     last_error = None
     while time.monotonic() < deadline:
@@ -1331,6 +1334,35 @@ def wait_for_star_field(args, debug, loop_index):
                 if debug.enabled:
                     debug.log(f"loop{loop_index:03d}: waiting for star field: {last_error}")
         time.sleep(args.field_poll_interval)
+    return None, last_error
+
+
+def wait_for_star_field(args, debug, loop_index):
+    rect, last_error = wait_for_star_field_once(args, debug, loop_index, args.field_wait_timeout)
+    if rect is not None:
+        return rect
+
+    retry_count = 0
+    while retry_count < args.field_start_retry_count:
+        retry_count += 1
+        if debug.enabled:
+            debug.log(
+                f"loop{loop_index:03d}: star_field_retry_start_click "
+                f"retry={retry_count}/{args.field_start_retry_count} last_error={last_error}"
+            )
+            debug.save_text()
+        try:
+            wait_and_click_auto_fish(args, debug, loop_index, timeout=args.field_start_retry_timeout, context="retry")
+            move_to_expected_star_field_center(args, debug, loop_index)
+            time.sleep(args.after_start_delay)
+            rect, last_error = wait_for_star_field_once(args, debug, loop_index, args.field_wait_timeout)
+            if rect is not None:
+                return rect
+        except RuntimeError as exc:
+            last_error = str(exc)
+            if debug.enabled:
+                debug.log(f"loop{loop_index:03d}: star_field_retry_failed retry={retry_count} error={last_error}")
+                debug.save_text()
 
     if debug.enabled:
         debug.save_image(f"loop{loop_index:03d}_star_field_timeout.png", grab_screen())
@@ -1525,6 +1557,8 @@ def main():
     parser.add_argument("--after-start-delay", type=float, default=0.2, help="Seconds to wait after clicking the fishing start button before solving the constellation")
     parser.add_argument("--field-wait-timeout", type=float, default=5.0, help="Seconds to wait for the constellation field after clicking the fishing start button")
     parser.add_argument("--field-poll-interval", type=float, default=0.10, help="Seconds between constellation field checks after the start click")
+    parser.add_argument("--field-start-retry-count", type=int, default=1, help="Retry clicking a still-visible fishing start button this many times if the constellation field does not appear")
+    parser.add_argument("--field-start-retry-timeout", type=float, default=1.5, help="Seconds to look for a still-visible fishing start button before each constellation field retry")
     args = parser.parse_args()
     debug = DebugLog(args.debug_dir)
     VERTEX_TEMPLATE = load_vertex_template(args.vertex_template)
