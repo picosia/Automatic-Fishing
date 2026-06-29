@@ -1093,6 +1093,8 @@ def find_auto_fish_button(screen):
     x1 = int(screen.width * 0.68)
     y0 = int(screen.height * 0.34)
     y1 = int(screen.height * 0.74)
+    min_button_y = screen.height * 0.50
+    max_button_y = screen.height * 0.64
     panel_mask = []
     for y in range(y0, y1):
         for x in range(x0, x1):
@@ -1138,7 +1140,14 @@ def find_auto_fish_button(screen):
             w = bx1 - bx0 + 1
             h = by1 - by0 + 1
             bcx = (bx0 + bx1) / 2
-            if 45 <= w <= 120 and 28 <= h <= 48 and screen.width * 0.43 <= bcx <= screen.width * 0.62 and by0 >= py0 + ph * 0.65:
+            bcy = (by0 + by1) / 2
+            if (
+                45 <= w <= 120
+                and 28 <= h <= 48
+                and screen.width * 0.43 <= bcx <= screen.width * 0.62
+                and min_button_y <= bcy <= max_button_y
+                and by0 >= py0 + ph * 0.65
+            ):
                 # Prefer the button-sized component near the bottom of an
                 # actual fishing prompt panel. Checking every candidate panel
                 # handles reward popups overlapping the prompt.
@@ -1190,7 +1199,7 @@ def find_auto_fish_button_fallback(screen, x0, x1, y0, y1):
             continue
         if not (screen.width * 0.43 <= bcx <= screen.width * 0.58):
             continue
-        if not (screen.height * 0.50 <= bcy <= screen.height * 0.68):
+        if not (screen.height * 0.50 <= bcy <= screen.height * 0.64):
             continue
 
         text_bands = 0
@@ -1326,7 +1335,7 @@ def wait_for_star_field_once(args, debug, loop_index, timeout):
                 )
                 debug.log(f"loop{loop_index:03d}: star_field_ready rect={rect}")
                 debug.save_text()
-            return rect
+            return rect, None
         except Exception as exc:
             last_error = str(exc)
             if last_seen is None or time.monotonic() - last_seen > 0.75:
@@ -1551,7 +1560,7 @@ def main():
     parser.add_argument("--loop-count", type=int, default=0, help="Number of auto-loop cycles. 0 means run until stopped")
     parser.add_argument("--start-wait-timeout", type=float, default=90.0, help="Seconds to wait for the fishing start prompt in auto-loop mode")
     parser.add_argument("--start-poll-interval", type=float, default=0.25, help="Seconds between start prompt checks")
-    parser.add_argument("--start-confirm-frames", type=int, default=2, help="Require this many consecutive start button detections before clicking")
+    parser.add_argument("--start-confirm-frames", type=int, default=3, help="Require this many consecutive start button detections before clicking")
     parser.add_argument("--start-confirm-distance", type=float, default=6.0, help="Maximum pixel drift allowed between consecutive start button detections")
     parser.add_argument("--no-start-button-debug-images", action="store_true", help="Do not save full-screen debug images for the auto-fish start button")
     parser.add_argument("--after-start-delay", type=float, default=0.2, help="Seconds to wait after clicking the fishing start button before solving the constellation")

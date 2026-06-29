@@ -85,6 +85,8 @@ Use `Start` to begin the scheduled loop and `Stop` to terminate it. If the game 
 
 ## Build GUI exe
 
+The exe is not committed to Git. Build it locally after cloning or after changing the GUI/build inputs.
+
 Install the normal runtime dependencies first:
 
 ```powershell
@@ -103,7 +105,18 @@ The executable is written under:
 dist\SenseiFishing\SenseiFishing.exe
 ```
 
-Run the exe as administrator when the game is running as administrator.
+`build_gui_exe.bat` also installs the build dependency from `requirements-dev.txt` into the selected Python environment before running PyInstaller.
+
+The build copies these runtime data files into the exe folder:
+
+```text
+auto_fishing_start.json
+vertex_template.json
+```
+
+If you change the fixed start coordinates in `auto_fishing_start.json`, rebuild the exe before using that change from `dist\SenseiFishing\SenseiFishing.exe`.
+
+Run the exe as administrator when the game is running as administrator. The GUI uses the same scheduled loop behavior as `run_sensei_scheduled_loop.bat`.
 
 ## Dry run
 
