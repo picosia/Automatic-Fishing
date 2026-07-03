@@ -343,7 +343,11 @@ def auto_detect_rect(screen):
     runs = longest_border_runs(screen)
     modal_frames = find_minigame_modal_frames(screen, runs)
     best = None
+    min_field_top = int(screen.height * 0.18)
+    max_field_top = int(screen.height * 0.65)
     for i, (top_y, top_x0, top_x1, top_len) in enumerate(runs):
+        if not min_field_top <= top_y <= max_field_top:
+            continue
         for bottom_y, bottom_x0, bottom_x1, bottom_len in runs[i + 1:]:
             height = bottom_y - top_y + 1
             if not 250 <= height <= 330:
@@ -366,7 +370,7 @@ def auto_detect_rect(screen):
         for top_y, top_x0, top_x1, top_len in runs:
             if not 520 <= top_len <= 620:
                 continue
-            if not int(screen.height * 0.18) <= top_y <= int(screen.height * 0.65):
+            if not min_field_top <= top_y <= max_field_top:
                 continue
             if not looks_like_star_field_below(screen, top_x0, top_x1, top_y):
                 continue
